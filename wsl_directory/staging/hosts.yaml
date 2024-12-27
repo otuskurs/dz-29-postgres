@@ -1,0 +1,37 @@
+
+all:
+  vars:
+    host_ip: 192.168.1.8 # windows host ip
+    dir_wsl: /home/sof/otus_labs/postgres/ # directory wsl whith ansible files
+    dir_vagrant: /mnt/d/VBox_Projects/postgres/ # directory wsl whith vagrant files
+
+    replicator_password: Otus2022!
+    master_ip: 192.168.57.11
+    slave_ip: 192.168.57.12
+    barman_ip: 192.168.57.13
+    barman_user: barman
+    barman_user_password: Otus2022!
+
+
+localhost:
+    hosts:
+        wsl:
+            ansible_host: 127.0.0.1
+            ansible_connection: local
+
+vms:
+    hosts:
+        node1:
+            ansible_host: "{{ host_ip }}"
+            ansible_port: 2247
+            ansible_private_key_file: "{{ 'certs/' + inventory_hostname + '/private_key' }}"
+            ip: 192.168.57.11
+        node2:
+            ansible_host: "{{ host_ip }}"
+            ansible_port: 2248
+            ansible_private_key_file: "{{ 'certs/' + inventory_hostname + '/private_key' }}"
+            ip: 192.168.57.12
+        barman:
+            ansible_host: "{{ host_ip }}"
+            ansible_port: 2249
+            ansible_private_key_file: "{{ 'certs/' + inventory_hostname + '/private_key' }}"

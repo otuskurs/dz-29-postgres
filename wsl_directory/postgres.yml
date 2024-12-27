@@ -1,0 +1,271 @@
+---
+- name: WSL localhost copy private_key
+  hosts: wsl
+  become: false
+  tasks:
+
+    - name: Create directory for private_key
+      file:
+        path: "{{ dir_wsl + 'certs/' + item }}"
+        state: directory
+      loop: "{{ query('inventory_hostnames', 'vms') }}"
+
+    - name: Copy private_key file
+      copy:
+        src: "{{ dir_vagrant + '/.vagrant/machines/' + item + '/virtualbox/private_key' }}"
+        dest: "{{ dir_wsl + 'certs/' + item + '/private_key' }}"
+      loop: "{{ query('inventory_hostnames', 'vms') }}"
+
+    - name: Change permissions for private_key
+      file:
+        dest: "{{ dir_wsl + 'certs/' + item + '/private_key' }}"
+        mode: 0400
+      loop: "{{ query('inventory_hostnames', 'vms') }}"
+
+
+- name: Configure Replication Postgres
+  hosts: node1, node2
+  become: true
+  tasks:
+
+    - name: Set timezone
+      timezone:
+        name: Europe/Moscow
+
+    - name: Install packages
+      apt:
+        name:
+          - vim
+          - nano
+          - telnet
+          - postgresql
+          - postgresql-contrib
+          - python3-pexpect
+          - python3-psycopg2
+        state: present
+        update_cache: true
+
+    - name: Start postgresql
+      service:
+        state: started
+        name: postgresql
+        enabled: true
+
+    - name: Create replicator user
+      become_user: postgres
+      community.postgresql.postgresql_user:
+        name: replication
+        password: "{{ replicator_password }}"
+        role_attr_flags: REPLICATION
+      ignore_errors: true
+      when: (ansible_hostname == "node1")
+
+    - name: Copy config files
+      template:
+        src: "templates/{{ item.src }}"
+        dest: "/etc/postgresql/14/main/{{ item.dest }}"
+        owner: postgres
+        group: postgres
+        mode: '0600'
+      with_items:
+        - { src: "postgresql.conf.j2", dest: "postgresql.conf" }
+        - { src: "pg_hba.conf.j2", dest: "pg_hba.conf" }
+      when: (ansible_hostname == "node1")
+
+    - name: Restart postgresql on node1
+      service:
+        state: restarted
+        name: postgresql
+        enabled: true
+      when: (ansible_hostname == "node1")
+
+    - name: Stop postgresql on node2
+      service:
+        state: stopped
+        name: postgresql
+      when: (ansible_hostname == "node2")
+
+    - name: Remove files from data catalog
+      file:
+        path: /var/lib/postgresql/14/main/
+        state: absent
+      when: (ansible_hostname == "node2")
+
+    - name: Copy files from master to slave
+      become_user: postgres
+      expect:
+        command: 'pg_basebackup -h {{ master_ip }} -U  replication -p 5432 -D /var/lib/postgresql/14/main/ -R -P'
+        responses:
+          '.*Password*': "{{ replicator_password }}"
+      when: (ansible_hostname == "node2")
+
+    - name: Copy config files
+      template:
+        src: "templates/{{ item.src }}"
+        dest: "/etc/postgresql/14/main/{{ item.dest }}"
+        owner: postgres
+        group: postgres
+        mode: '0600'
+      with_items:
+        - { src: "postgresql.conf.j2", dest: "postgresql.conf" }
+        - { src: "pg_hba.conf.j2", dest: "pg_hba.conf" }
+      when: (ansible_hostname == "node2")
+
+    - name: Restart postgresql on node1
+      service:
+        state: restarted
+        name: postgresql
+      when: (ansible_hostname == "node2")
+
+
+- name: Configure Barman Backup
+  hosts: vms
+  become: true
+  tasks:
+
+    - name: Set timezone
+      timezone:
+        name: Europe/Moscow
+      when: (ansible_hostname == "barman")
+
+    - name: Install packages
+      apt:
+        name:
+          - barman-cli
+          - bash-completion
+          - wget
+        state: present
+        update_cache: true
+      when: (ansible_hostname != "barman")
+
+    - name: Install packages
+      apt:
+        name:
+          - vim
+          - nano
+          - telnet
+          - barman-cli
+          - barman
+          - postgresql
+          - bash-completion
+          - wget
+          - python3-pexpect
+          - python3-psycopg2
+        state: present
+        update_cache: true
+      when: (ansible_hostname == "barman")
+
+    - name: generate SSH key for postgres
+      user:
+        name: postgres
+        generate_ssh_key: yes
+        ssh_key_type: rsa
+        ssh_key_bits: 4096
+        force: no
+      when: (ansible_hostname == "node1")
+
+    - name: generate SSH key for barman
+      user:
+        name: barman
+        uid: 994
+        shell: /bin/bash
+        generate_ssh_key: yes
+        ssh_key_type: rsa
+        ssh_key_bits: 4096
+        force: no
+      when: (ansible_hostname == "barman")
+
+    - name: fetch all public ssh keys node1
+      shell: cat /var/lib/postgresql/.ssh/id_rsa.pub
+      register: ssh_keys
+      when: (ansible_hostname == "node1")
+
+    - name: transfer public key to barman
+      delegate_to: barman
+      authorized_key:
+        key: "{{ ssh_keys.stdout }}"
+        comment: "{{ansible_hostname}}"
+        user: barman
+      when: (ansible_hostname == "node1")
+
+    - name: fetch all public ssh keys barman
+      shell: cat /var/lib/barman/.ssh/id_rsa.pub
+      register: ssh_keys
+      when: (ansible_hostname == "barman")
+
+    - name: transfer public key to barman
+      delegate_to: node1
+      authorized_key:
+        key: "{{ ssh_keys.stdout }}"
+        comment: "{{ansible_hostname}}"
+        user: postgres
+      when: (ansible_hostname == "barman")
+
+    - name: Create barman user
+      become_user: postgres
+      postgresql_user:
+        name: "{{ barman_user }}"
+        password: "{{ barman_user_password }}"
+        role_attr_flags: SUPERUSER
+      ignore_errors: true
+      when: (ansible_hostname == "node1")
+
+    - name: restart postgresql-server on node1
+      service:
+        name: postgresql
+        state: restarted
+      when: (ansible_hostname == "node1")
+
+    - name: Create DB for backup
+      become_user: postgres
+      postgresql_db:
+        name: otus
+        encoding: UTF-8
+        template: template0
+        state: present
+      when: (ansible_hostname == "node1")
+
+    - name: Add tables to otus_backup
+      become_user: postgres
+      postgresql_table:
+        db: otus
+        name: test1
+        state: present
+      when: (ansible_hostname == "node1")
+
+    - name: copy .pgpass
+      template:
+        src: templates/.pgpass.j2
+        dest: /var/lib/barman/.pgpass
+        owner: barman
+        group: barman
+        mode: '0600'
+      when: (ansible_hostname == "barman")
+
+    - name: copy barman.conf
+      template:
+        src: templates/barman.conf.j2
+        dest: /etc/barman.conf
+        owner: barman
+        group: barman
+        mode: '0755'
+      when: (ansible_hostname == "barman")
+
+    - name: copy node1.conf
+      template:
+        src: templates/node1.conf.j2
+        dest: /etc/barman.d/node1.conf
+        owner: barman
+        group: barman
+        mode: '0755'
+      when: (ansible_hostname == "barman")
+
+    - name: barman switch-wal node1
+      become_user: barman
+      shell: barman switch-wal node1
+      when: (ansible_hostname == "barman")
+
+    - name: barman cron
+      become_user: barman
+      shell: barman cron
+      when: (ansible_hostname == "barman")
